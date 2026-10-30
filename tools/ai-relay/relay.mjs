@@ -6,16 +6,20 @@
  *   （/claude/v1、/gemini/v1、/codex/v1 …）分通道排队，写进收件目录，等外部 AI 交回结果后
  *   再作为 API 响应返回给书童。
  * mcp 模式：stdio MCP 服务器，供 Claude 桌面端、Codex、Gemini CLI 取任务、交结果。
+ * 自动模式：relay.config.json 里把某个通道设成 cli，转发站会直接调用对应的命令行工具
+ *   （claude -p、codex exec、gemini -p）处理任务，失败时退回人工队列。
  *
  * 只依赖 Node 22 自带模块。
  */
 
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createInterface } from 'node:readline'
 
 const PORT = Number(process.env.AI_RELAY_PORT || 8787)
@@ -23,6 +27,8 @@ const HOST = '127.0.0.1'
 const INBOX = process.env.AI_RELAY_DIR || join(homedir(), 'ai-relay-inbox')
 const KEEPALIVE_MS = 15_000
 const PLATFORM_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
+const CONFIG_PATH = process.env.AI_RELAY_CONFIG || join(dirname(fileURLToPath(import.meta.url)), 'relay.config.json')
+const MAX_WAIT_SECONDS = 110
 
 // ===== serve 模式 =====
 
@@ -30,10 +36,26 @@ const PLATFORM_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
 const tasks = new Map()
 
 /**
+ * state：pending 等人工或 MCP 处理；auto 正由命令行工具处理，不对外发放。
  * @typedef {{ id: string, platform: string, model: string, createdAt: number, claimedAt?: number,
  *   json: boolean, messages: Array<{role: string, content: string}>, prompt: string,
+ *   state: 'pending' | 'auto', child?: import('node:child_process').ChildProcess,
  *   finish: (content: string) => void, cancel: () => void }} Task
  */
+
+/**
+ * 每次新任务都重新读配置，改了配置不用重启转发站。
+ * @returns {{ mode?: 'manual' | 'cli', command?: string, args?: string[], timeoutMinutes?: number } | null}
+ */
+function channelConfig(platform) {
+  if (!existsSync(CONFIG_PATH)) return null
+  try {
+    return JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).channels?.[platform] ?? null
+  } catch (error) {
+    log(`! 配置文件 ${CONFIG_PATH} 读取失败：${error.message}`)
+    return null
+  }
+}
 
 function renderPrompt(id, platform, body, json) {
   const lines = [
@@ -74,23 +96,30 @@ function summary(task) {
     model: task.model,
     json: task.json,
     claimed: Boolean(task.claimedAt),
+    state: task.state,
     createdAt: new Date(task.createdAt).toISOString(),
     chars: task.prompt.length,
     preview: text.replace(/\s+/g, ' ').slice(0, 120),
   }
 }
 
-function pending(platform) {
+function listTasks(platform) {
   return [...tasks.values()]
     .filter(t => !platform || t.platform === platform)
     .sort((a, b) => a.createdAt - b.createdAt)
+}
+
+/** 可以交给人工或 MCP 的任务：未领取的排在前面，已领取但迟迟没交回的放后面兜底。 */
+function nextPending(platform) {
+  const open = listTasks(platform).filter(t => t.state === 'pending')
+  return open.find(t => !t.claimedAt) ?? open[0] ?? null
 }
 
 async function archive(task, status, answer) {
   const dir = join(INBOX, task.platform)
   const doneDir = join(INBOX, '_done')
   await mkdir(doneDir, { recursive: true })
-  for (const suffix of ['.prompt.md', '.answer.md']) {
+  for (const suffix of ['.prompt.md', '.answer.md', '.cli-error.txt']) {
     const from = join(dir, task.id + suffix)
     if (existsSync(from)) await rename(from, join(doneDir, `${task.id}.${status}${suffix}`)).catch(() => {})
   }
@@ -123,6 +152,69 @@ async function readBody(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
   return Buffer.concat(chunks).toString('utf8')
+}
+
+const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g
+/** 每个通道的命令行任务排队串行执行，避免同时开一堆进程。 */
+const cliQueues = new Map()
+
+function enqueueCli(task, config) {
+  const previous = cliQueues.get(task.platform) ?? Promise.resolve()
+  const next = previous.then(() => runCli(task, config)).catch(error => log(`! ${error?.stack ?? error}`))
+  cliQueues.set(task.platform, next)
+}
+
+async function runCli(task, config) {
+  if (!tasks.has(task.id)) return
+  const workDir = join(INBOX, '_work', task.id)
+  await mkdir(workDir, { recursive: true })
+  const outputFile = join(workDir, 'output.md')
+  const rawArgs = config.args ?? []
+  const promptInArgs = rawArgs.some(arg => arg.includes('{prompt}'))
+  const args = rawArgs.map(arg => arg.replaceAll('{prompt}', task.prompt).replaceAll('{output}', outputFile))
+  const timeoutMs = (config.timeoutMinutes ?? 20) * 60_000
+  log(`⚙ ${task.platform} ${task.id} 交给命令行 ${config.command} 自动处理`)
+
+  const result = await new Promise(resolve => {
+    let stdout = ''
+    let stderr = ''
+    let child
+    try {
+      child = spawn(config.command, args, { cwd: workDir, shell: process.platform === 'win32', stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch (error) {
+      return resolve({ ok: false, reason: error.message })
+    }
+    task.child = child
+    const timer = setTimeout(() => { child.kill('SIGTERM'); stderr += `\n超过 ${config.timeoutMinutes ?? 20} 分钟未完成，已终止。` }, timeoutMs)
+    child.stdout.on('data', chunk => { stdout += chunk })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', error => {
+      clearTimeout(timer)
+      resolve({ ok: false, reason: error.code === 'ENOENT' ? `找不到命令 ${config.command}，请确认已安装并在 PATH 里。` : error.message })
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      resolve(code === 0 ? { ok: true, stdout } : { ok: false, reason: `退出码 ${code}\n${stderr.slice(-4000)}` })
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.end(promptInArgs ? '' : task.prompt)
+  })
+  task.child = undefined
+
+  let content = result.ok ? result.stdout : ''
+  if (result.ok && existsSync(outputFile)) content = await readFile(outputFile, 'utf8').catch(() => content)
+  content = content.replace(ANSI_RE, '').trim()
+  await rm(workDir, { recursive: true, force: true }).catch(() => {})
+  if (!tasks.has(task.id)) return
+
+  if (content) {
+    resolveTask(task.id, content)
+    return
+  }
+  const reason = result.ok ? '命令行没有输出任何内容。' : result.reason
+  task.state = 'pending'
+  await writeFile(join(INBOX, task.platform, `${task.id}.cli-error.txt`), reason).catch(() => {})
+  log(`! ${task.platform} ${task.id} 命令行处理失败，已退回人工队列：${reason.split('\n')[0]}`)
 }
 
 async function handleCompletion(req, res, platform) {
@@ -172,17 +264,21 @@ async function handleCompletion(req, res, platform) {
     res.end()
   }
 
-  const task = { id, platform, model, createdAt: Date.now(), json, messages: body.messages, prompt, finish, cancel }
+  const config = channelConfig(platform)
+  const auto = config?.mode === 'cli' && typeof config.command === 'string' && config.command.length > 0
+  const task = { id, platform, model, createdAt: Date.now(), json, messages: body.messages, prompt, state: auto ? 'auto' : 'pending', finish, cancel }
   tasks.set(id, task)
   await mkdir(join(INBOX, platform), { recursive: true })
   await writeFile(join(INBOX, platform, `${id}.prompt.md`), prompt)
-  log(`→ ${platform} 新任务 ${id}（${prompt.length} 字${json ? '，要求 JSON' : ''}）`)
+  log(`→ ${platform} 新任务 ${id}（${prompt.length} 字${json ? '，要求 JSON' : ''}${auto ? '，自动处理' : ''}）`)
+  if (auto) enqueueCli(task, config)
 
   res.on('close', () => {
     if (done) return
     done = true
     clearInterval(keepalive)
     if (tasks.delete(id)) {
+      task.child?.kill('SIGTERM')
       archive(task, 'cancelled')
       log(`× ${platform} ${id} 已被书童取消`)
     }
@@ -192,6 +288,7 @@ async function handleCompletion(req, res, platform) {
 /** 手动模式：在 <平台>/<id>.answer.md 写入结果即可交回。 */
 async function scanAnswers() {
   for (const task of tasks.values()) {
+    if (task.state !== 'pending') continue
     const file = join(INBOX, task.platform, `${task.id}.answer.md`)
     if (!existsSync(file)) continue
     const content = await readFile(file, 'utf8').catch(() => '')
@@ -201,11 +298,21 @@ async function scanAnswers() {
 
 async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/tasks') {
-    return sendJson(res, 200, pending(url.searchParams.get('platform')).map(summary))
+    return sendJson(res, 200, listTasks(url.searchParams.get('platform')).map(summary))
   }
   if (req.method === 'GET' && url.pathname === '/api/next') {
     const platform = url.searchParams.get('platform')
-    const task = pending(platform)[0]
+    // wait=秒数 时长轮询：期间来了任务立刻返回，供 MCP 值班模式使用。
+    const waitMs = Math.min(Number(url.searchParams.get('wait')) || 0, MAX_WAIT_SECONDS) * 1000
+    const deadline = Date.now() + waitMs
+    let closed = false
+    req.on('close', () => { closed = true })
+    let task = nextPending(platform)
+    while (!task && !closed && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      task = nextPending(platform)
+    }
+    if (closed) return
     if (!task) return sendJson(res, 200, { task: null })
     task.claimedAt ??= Date.now()
     return sendJson(res, 200, { task: { ...summary(task), prompt: task.prompt } })
@@ -291,6 +398,11 @@ function mcp(platform) {
       inputSchema: { type: 'object', properties: {} },
     },
     {
+      name: 'wait_for_task',
+      description: `值班用：等待${scope}的下一条任务，最多等 timeout_seconds 秒（默认 50，最大 ${MAX_WAIT_SECONDS}）。来了任务立刻返回 id 和完整提示词；超时没有任务就返回「暂无任务」，此时可以再调用一次继续等。`,
+      inputSchema: { type: 'object', properties: { timeout_seconds: { type: 'number' } } },
+    },
+    {
       name: 'get_task',
       description: '按 id 取回某条待处理任务的完整提示词。',
       inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
@@ -312,10 +424,17 @@ function mcp(platform) {
       const list = await (await fetch(`${base}/api/tasks${query}`)).json()
       return list.length ? JSON.stringify(list, null, 2) : `${scope}当前没有待处理任务。`
     }
-    if (name === 'get_next_task' || name === 'get_task') {
-      const url = name === 'get_task' ? `${base}/api/tasks/${encodeURIComponent(args.task_id ?? '')}` : `${base}/api/next${query}`
+    if (name === 'get_next_task' || name === 'get_task' || name === 'wait_for_task') {
+      const wait = name === 'wait_for_task' ? Math.min(Math.max(Number(args.timeout_seconds) || 50, 1), MAX_WAIT_SECONDS) : 0
+      const nextQuery = new URLSearchParams({ ...(platform ? { platform } : {}), ...(wait ? { wait: String(wait) } : {}) }).toString()
+      const url = name === 'get_task'
+        ? `${base}/api/tasks/${encodeURIComponent(args.task_id ?? '')}`
+        : `${base}/api/next${nextQuery ? `?${nextQuery}` : ''}`
       const data = await (await fetch(url)).json()
-      if (!data.task) return name === 'get_task' ? `找不到任务 ${args.task_id}，它可能已完成或被取消。` : `${scope}当前没有待处理任务。`
+      if (!data.task) {
+        if (name === 'get_task') return `找不到任务 ${args.task_id}，它可能已完成或被取消。`
+        return name === 'wait_for_task' ? `等了 ${wait} 秒，${scope}暂无任务。` : `${scope}当前没有待处理任务。`
+      }
       return `任务 id：${data.task.id}\n完成后调用 submit_result，task_id 填这个 id。\n\n${data.task.prompt}`
     }
     if (name === 'submit_result') {
@@ -349,7 +468,9 @@ function mcp(platform) {
           protocolVersion: params?.protocolVersion ?? '2025-06-18',
           capabilities: { tools: {} },
           serverInfo: { name: 'shutong-relay', version: '0.1.0' },
-          instructions: `书童转发站${scope}。用户说「处理下一个任务」时：get_next_task 取任务，按提示词写出成品，再 submit_result 交回。`,
+          instructions: `书童转发站${scope}。用户说「处理下一个任务」时：get_next_task 取任务，按提示词写出成品，再 submit_result 交回。`
+            + '用户说「开始值班」时：反复执行 wait_for_task → 按提示词写出成品 → submit_result，不要停下来向用户汇报或提问；'
+            + '连续 5 次等不到任务、或用户叫停时才结束，结束时用一句话说明处理了几条任务。',
         } })
       }
       if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} })
@@ -396,7 +517,7 @@ async function load(){
   const tasks=await fetch('/api/tasks').then(r=>r.json()).catch(()=>[]);
   for(const el of list.querySelectorAll('textarea'))drafts[el.dataset.id]=el.value;
   if(!tasks.length){list.innerHTML='<p class="empty">现在没有待处理的任务。在书童里点一个生成按钮，任务会出现在这里。</p>';return}
-  list.innerHTML=tasks.map(t=>'<div class="task"><div class="meta"><span class="chip">'+t.platform+'</span><span>'+t.id+'</span><span>'+t.chars+' 字</span>'+(t.json?'<span>要求 JSON</span>':'')+'</div><div>'+t.preview.replace(/</g,'&lt;')+'…</div><div class="row"><button data-copy="'+t.id+'">复制提示词</button></div><textarea data-id="'+t.id+'" placeholder="把 AI 的回答粘贴到这里"></textarea><div class="row"><button class="primary" data-send="'+t.id+'">交回书童</button></div></div>').join('');
+  list.innerHTML=tasks.map(t=>'<div class="task"><div class="meta"><span class="chip">'+t.platform+'</span><span>'+t.id+'</span><span>'+t.chars+' 字</span>'+(t.json?'<span>要求 JSON</span>':'')+'</div><div>'+t.preview.replace(/</g,'&lt;')+'…</div>'+(t.state==='auto'?'<p class="empty">命令行正在自动处理，完成后会自动交回。</p></div>':'<div class="row"><button data-copy="'+t.id+'">复制提示词</button></div><textarea data-id="'+t.id+'" placeholder="把 AI 的回答粘贴到这里"></textarea><div class="row"><button class="primary" data-send="'+t.id+'">交回书童</button></div></div>')).join('');
   for(const el of list.querySelectorAll('textarea'))el.value=drafts[el.dataset.id]||'';
 }
 list.addEventListener('click',async e=>{
