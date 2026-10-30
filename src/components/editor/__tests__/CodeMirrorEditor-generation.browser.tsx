@@ -175,6 +175,30 @@ describe('CodeMirror editor AI generation boundary', () => {
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('editor-inline:begin', expect.objectContaining({ modelId: 'stage-model' }), expect.any(Object)))
   })
 
+  it('sends an inline run to the model picked on the selection toolbar instead of the drafting stage model', async () => {
+    useLLMStore.setState({
+      models: [{ id: 'editor-model', name: 'Default', purposes: ['generation'] }, { id: 'stage-model', name: 'Drafting', purposes: ['generation'] }, { id: 'polish-model', name: 'Polish', purposes: ['generation'] }] as never,
+      stageModelIds: { drafting: 'stage-model' },
+    })
+    await act(async () => root.render(<CodeMirrorEditor content="原文段落" mode="prose" />))
+
+    await selectLine('原文段落')
+    const picker = page.getByRole('combobox', { name: '这次用哪个模型' })
+    await expect.element(picker).toHaveDisplayValue('跟随起草（Drafting）')
+    await act(async () => picker.selectOptions('Polish'))
+    await act(async () => page.getByRole('button', { name: '润色' }).click())
+
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('editor-inline:begin', expect.objectContaining({ modelId: 'polish-model' }), expect.any(Object)))
+  })
+
+  it('hides the selection model picker when only one generation model exists', async () => {
+    useLLMStore.setState({ models: [{ id: 'editor-model', name: 'Default', purposes: ['generation'] }] as never, stageModelIds: {} })
+    await act(async () => root.render(<CodeMirrorEditor content="原文段落" mode="prose" />))
+
+    await selectLine('原文段落')
+    await expect.element(page.getByRole('combobox', { name: '这次用哪个模型' })).not.toBeInTheDocument()
+  })
+
   it('applies a delayed AI result to the frozen original selection instead of a later selection', async () => {
     deferStream = true
     await act(async () => root.render(
