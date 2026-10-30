@@ -772,6 +772,24 @@
   color: var(--ink);
 }
 
+.cm-selbar-model {
+  height: 28px;
+  max-width: 168px;
+  padding: 0 var(--s-1);
+  border: 1px solid var(--rule-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink-2);
+  font: var(--fs-12)/1 var(--font-ui);
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.cm-selbar-model:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .cm-selbar-sep {
   width: 1px;
   height: 16px;

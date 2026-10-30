@@ -14,6 +14,8 @@ import type { MainGenerationRunHandle } from '../../services/generation/generati
 import { createEditorInlineGeneration } from '../../services/editor-inline-generation'
 import { EDITOR_INLINE_INSTRUCTION_MAX_LENGTH, type EditorInlineFixedAction, type EditorInlineRequest } from '../../shared/editor-inline-generation'
 import { routeModelId } from '../../services/model-routing'
+import { useLLMStore } from '../../stores/llm-store'
+import { isGenerationModel, routeStageModel, stageOfOperation } from '../../shared/model-stage-routing'
 import { countDraftUnits } from '../../shared/draft-units'
 import { useLocaleStore } from '../../stores/locale-store'
 import { displayedErrorMessage } from '../../i18n/app-errors'
@@ -66,6 +68,9 @@ const AI_ACTIONS: readonly { key: EditorInlineFixedAction; label: Label }[] = [
 ]
 const NOTE_LABEL: Label = ['按意见改', 'Revise with note']
 const actionLabel = (action: EditorInlineRequest['action']): Label => action === 'instruct' ? NOTE_LABEL : AI_ACTIONS.find(item => item.key === action)!.label
+
+/** 选段操作临时指定的模型；空值跟随「起草」环节。只在本次运行期间记住，切换章节也保留。 */
+let rememberedInlineModelId: string | null = null
 
 export default function CodeMirrorEditor({
   content,
@@ -146,6 +151,17 @@ export default function CodeMirrorEditor({
   const [noteDraft, setNoteDraft] = useState<string | null>(null)
   const [activeNote, setActiveNote] = useState<string | null>(null)
   const [bubbleSize, setBubbleSize] = useState({ width: 0, height: 0 })
+  const llmModels = useLLMStore(s => s.models)
+  const draftingModelId = useLLMStore(s => routeStageModel(stageOfOperation('editor-inline'), s).modelId)
+  const generationModels = useMemo(() => llmModels.filter(isGenerationModel), [llmModels])
+  const [inlineModelId, setInlineModelIdState] = useState<string | null>(rememberedInlineModelId)
+  const setInlineModelId = (modelId: string | null) => { rememberedInlineModelId = modelId; setInlineModelIdState(modelId) }
+  // 临时指定的模型被删除或不再能生成时，回到跟随「起草」。
+  const pickedInlineModelId = inlineModelId && generationModels.some(model => model.id === inlineModelId) ? inlineModelId : null
+  const modelLabel = (modelId: string | null) => {
+    const model = generationModels.find(item => item.id === modelId)
+    return model ? model.name || model.modelName : null
+  }
   const bubbleRef = useCallback((node: HTMLDivElement | null) => {
     if (!node) return
     const measure = () => setBubbleSize(size => size.width === node.offsetWidth && size.height === node.offsetHeight ? size : { width: node.offsetWidth, height: node.offsetHeight })
@@ -433,7 +449,7 @@ export default function CodeMirrorEditor({
       aiCandidateRef.current = null
       setActiveAIAction(uiText(...actionLabel(request.action))); setActiveNote(request.action === 'instruct' ? request.instruction : null)
       setNoteDraft(null); setAiResult(''); setAiError(null); setCanResumeAI(false)
-      const recovery = await client.open({ input, modelId: routeModelId('editor-inline') ?? '', uiActionNonce: crypto.randomUUID() })
+      const recovery = await client.open({ input, modelId: pickedInlineModelId ?? routeModelId('editor-inline') ?? '', uiActionNonce: crypto.randomUUID() })
       if (requestSequence !== aiRequestSequenceRef.current) return
       onGenerationHandle?.(recovery.view.handle)
       const receipt = await client.execute()
@@ -608,7 +624,7 @@ export default function CodeMirrorEditor({
           data-theme={inkThemeName}
           data-preview={aiResult !== null || undefined}
           style={{ top: bubbleTop, left: bubbleLeft }}
-          onMouseDown={(e) => { if (!(e.target instanceof HTMLTextAreaElement)) e.preventDefault() }}
+          onMouseDown={(e) => { if (!(e.target instanceof HTMLTextAreaElement) && !(e.target instanceof HTMLSelectElement)) e.preventDefault() }}
         >
           {aiResult !== null ? (
             <div className="cm-selbar-preview">
@@ -686,6 +702,23 @@ export default function CodeMirrorEditor({
                       }
                     }}
                   ><Bold size={14} aria-hidden="true" /></Button>
+                  <span className="cm-selbar-sep" aria-hidden="true" />
+                </>
+              )}
+              {generationModels.length > 1 && (
+                <>
+                  <select
+                    className="cm-selbar-model"
+                    aria-label={uiText('这次用哪个模型', 'Model for this edit')}
+                    title={uiText('这次用哪个模型', 'Model for this edit')}
+                    value={pickedInlineModelId ?? ''}
+                    onChange={(e) => setInlineModelId(e.target.value || null)}
+                  >
+                    <option value="">{uiText(`跟随起草（${modelLabel(draftingModelId) ?? '未设置'}）`, `Drafting default (${modelLabel(draftingModelId) ?? 'not set'})`)}</option>
+                    {generationModels.map(model => (
+                      <option key={model.id} value={model.id}>{model.name || model.modelName}</option>
+                    ))}
+                  </select>
                   <span className="cm-selbar-sep" aria-hidden="true" />
                 </>
               )}
