@@ -257,6 +257,13 @@ function serve() {
       else res.end()
     }
   })
+  server.on('error', error => {
+    if (error.code === 'EADDRINUSE') {
+      log(`端口 ${PORT} 已被别的程序占用。换个端口启动，例如：AI_RELAY_PORT=8790 node relay.mjs serve`)
+      process.exit(1)
+    }
+    throw error
+  })
   server.requestTimeout = 0
   server.headersTimeout = 60_000
   server.listen(PORT, HOST, () => {
